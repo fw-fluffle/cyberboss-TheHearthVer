@@ -3,7 +3,7 @@ const fs = require("fs");
 const path = require("path");
 const { readConfig } = require("../core/config");
 const { ChannelIdempotencyStore, hashIdempotencyKey } = require("../core/channel-idempotency-store");
-const { createHearthBridgeClient } = require("../core/hearth-bridge-client");
+const { createHearthBridgeClient, createDryRunDeliverySink } = require("../core/hearth-bridge-client");
 
 const DEFAULT_LONG_POLL_TIMEOUT_MS = 35_000;
 const RETRY_DELAY_MS = 2_000;
@@ -87,8 +87,9 @@ function defaultIsProcessAlive(pid) {
 
 function parseObserveConfig(env = process.env) {
   const mode = String(env.HEARTH_WEIXIN_MODE || "observe").trim().toLowerCase() || "observe";
-  if (!["observe", "echo", "bridge"].includes(mode)) {
-    throw new Error("HEARTH_WEIXIN_MODE only supports observe, echo or bridge");
+  // bridge：真实投递（仍可注入 dry-run delivery）；bridge_dry_run：契约接线专用，不写 delivered。
+  if (!["observe", "echo", "bridge", "bridge_dry_run"].includes(mode)) {
+    throw new Error("HEARTH_WEIXIN_MODE only supports observe, echo, bridge or bridge_dry_run");
   }
   const allowedUserIds = new Set(
     String(env.HEARTH_WEIXIN_ALLOWED_USER_IDS || "")
@@ -96,7 +97,7 @@ function parseObserveConfig(env = process.env) {
       .map((value) => value.trim())
       .filter(Boolean),
   );
-  return { mode, allowedUserIds };
+  return { mode, allowedUserIds, isBridge: mode === "bridge" || mode === "bridge_dry_run", dryRun: mode === "bridge_dry_run" };
 }
 
 function createHearthChannelOnlyObserver({
@@ -105,6 +106,7 @@ function createHearthChannelOnlyObserver({
   env = process.env,
   idempotencyStore,
   bridgeClient,
+  delivery,
   logger = console,
   now = () => Date.now(),
 } = {}) {
@@ -112,12 +114,16 @@ function createHearthChannelOnlyObserver({
     throw new Error("Hearth channel-only observer requires a channel adapter");
   }
   const observeConfig = parseObserveConfig(env);
-  const bridge = observeConfig.mode === "bridge" ? (bridgeClient || createHearthBridgeClient({ env })) : null;
+  const bridge = observeConfig.isBridge ? (bridgeClient || createHearthBridgeClient({ env })) : null;
+  const dryRunSink = observeConfig.dryRun ? (delivery || createDryRunDeliverySink()) : null;
+  const deliver = delivery || null;
   const ledger = idempotencyStore || new ChannelIdempotencyStore({
     filePath: path.join(config?.stateDir || process.cwd(), "hearth-channel-idempotency.json"),
     now,
     onWarning: (message) => logSafe(logger, { type: "hearth_weixin_observe", status: "warning", message }),
   });
+  // 进程内 inflight：同 key 并发第二请求不得再次打 Hearth。
+  const inflightKeys = new Set();
 
   async function processRawMessage(rawMessage, account) {
     const bridgeReceivedAtMs = now();
@@ -144,6 +150,10 @@ function createHearthChannelOnlyObserver({
     if (ledger.has(idempotencyKey)) {
       logObserve(logger, metadata, "duplicate");
       return { status: "duplicate", event: null };
+    }
+    if (inflightKeys.has(idempotencyKey)) {
+      logObserve(logger, metadata, "processing");
+      return { status: "processing", event: null };
     }
 
     let normalized;
@@ -195,25 +205,74 @@ function createHearthChannelOnlyObserver({
       return { status: "echoed", event };
     }
 
-    if (observeConfig.mode === "bridge") {
-      await adapter.sendTyping({ userId: metadata.sender_id, status: 1, contextToken: normalized.contextToken }).catch((error) => {
-        logSafe(logger, { type: "hearth_weixin_bridge", status: "typing_failed", error_type: safeErrorType(error) });
-      });
-      let response;
-      try { response = await bridge.request(event); } catch (error) {
-        logSafe(logger, { type: "hearth_weixin_bridge", status: "bridge_failed", error_type: safeErrorType(error), error_code: safeErrorCode(error) });
-        return { status: "bridge_failed", event: null };
-      }
+    if (observeConfig.isBridge) {
+      inflightKeys.add(idempotencyKey);
       try {
-        for (const segment of response.segments) await adapter.sendText({ userId: metadata.sender_id, text: segment, contextToken: normalized.contextToken });
-      } catch (error) {
-        logSafe(logger, { type: "hearth_weixin_bridge", status: "delivery_failed", error_type: safeErrorType(error) });
-        return { status: "delivery_failed", event: null };
+        await adapter.sendTyping({ userId: metadata.sender_id, status: 1, contextToken: normalized.contextToken }).catch((error) => {
+          logSafe(logger, { type: "hearth_weixin_bridge", status: "typing_failed", error_type: safeErrorType(error) });
+        });
+        let response;
+        try {
+          response = await bridge.request(event);
+        } catch (error) {
+          const code = safeErrorCode(error);
+          logSafe(logger, {
+            type: "hearth_weixin_bridge",
+            status: "bridge_failed",
+            error_type: safeErrorType(error),
+            error_code: code,
+          });
+          // Gateway 409：视为已处理，落 ledger 防重复调用；不投递、不写 assistant_sent_at。
+          if (code === "duplicate_or_processing") {
+            ledger.mark(idempotencyKey, { status: "bridge_duplicate", recordedAtMs: bridgeReceivedAtMs });
+            logObserve(logger, event, "bridge_duplicate");
+            return { status: "bridge_duplicate", event: null };
+          }
+          return { status: "bridge_failed", event: null };
+        }
+
+        try {
+          if (observeConfig.dryRun) {
+            await dryRunSink.deliverSegments(response.segments);
+          } else if (deliver && typeof deliver.deliverSegments === "function") {
+            await deliver.deliverSegments(response.segments, {
+              userId: metadata.sender_id,
+              contextToken: normalized.contextToken,
+            });
+          } else {
+            for (const segment of response.segments) {
+              await adapter.sendText({
+                userId: metadata.sender_id,
+                text: segment,
+                contextToken: normalized.contextToken,
+              });
+            }
+          }
+        } catch (error) {
+          logSafe(logger, { type: "hearth_weixin_bridge", status: "delivery_failed", error_type: safeErrorType(error) });
+          return { status: "delivery_failed", event: null };
+        }
+
+        if (observeConfig.dryRun) {
+          // Dry-run：只记契约成功，绝不冒充真实微信 delivered / assistant_sent_at。
+          ledger.mark(idempotencyKey, { status: "bridged_dry_run", recordedAtMs: bridgeReceivedAtMs });
+          logObserve(logger, event, "bridged_dry_run");
+          return {
+            status: "bridged_dry_run",
+            event,
+            segments: response.segments,
+            request_id: response.requestId || "",
+            gateway_processed_at: response.gatewayProcessedAt || "",
+          };
+        }
+
+        const assistantSentAt = new Date(now()).toISOString();
+        ledger.mark(idempotencyKey, { status: "delivered", recordedAtMs: Date.parse(assistantSentAt) });
+        logObserve(logger, event, "delivered");
+        return { status: "delivered", event: { ...event, assistant_sent_at: assistantSentAt } };
+      } finally {
+        inflightKeys.delete(idempotencyKey);
       }
-      const assistantSentAt = new Date(now()).toISOString();
-      ledger.mark(idempotencyKey, { status: "delivered", recordedAtMs: Date.parse(assistantSentAt) });
-      logObserve(logger, event, "delivered");
-      return { status: "delivered", event: { ...event, assistant_sent_at: assistantSentAt } };
     }
 
     ledger.mark(idempotencyKey, { status: "observed", recordedAtMs: bridgeReceivedAtMs });
@@ -239,6 +298,8 @@ function createHearthChannelOnlyObserver({
   return {
     mode: observeConfig.mode,
     allowedUserIds: observeConfig.allowedUserIds,
+    dryRun: observeConfig.dryRun,
+    dryRunSink,
     processRawMessage,
     processUpdateResponse,
   };

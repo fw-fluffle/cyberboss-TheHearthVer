@@ -151,13 +151,14 @@ test("bridge delivers validated segments once and persists delivered", async () 
 });
 
 test("bridge validation and failures never deliver partial invalid responses", async () => {
-  assert.throws(() => validateBridgeResponse({ action: "send", reply_text: "a", segments: ["b"] }));
+  assert.throws(() => validateBridgeResponse({ action: "send", reply_text: "", segments: [] }));
+  assert.throws(() => validateBridgeResponse({ action: "silent", reply_text: "x", segments: ["x"] }));
   const adapter = createAdapter(); const observer = createHearthChannelOnlyObserver({ adapter, config: { stateDir: path.dirname(tempPath()) }, env: { HEARTH_WEIXIN_MODE: "bridge", HEARTH_WEIXIN_ALLOWED_USER_IDS: "allowed-user" }, logger: createLogger(), bridgeClient: { async request() { throw Object.assign(new Error("timeout"), { code: "timeout" }); } } });
   assert.equal((await observer.processRawMessage(message(), { accountId: "account-1" })).status, "bridge_failed"); assert.equal(adapter.calls.sendText, 0);
 });
 
 test("bridge fails closed without secrets and stops after a segment send failure", async () => {
-  assert.throws(() => createHearthBridgeClient({ env: {} }), /incomplete/);
+  assert.throws(() => createHearthBridgeClient({ env: {} }), /URL|token|secret|configured/i);
   const adapter = createAdapter(); let sent = 0;
   adapter.sendText = async (payload) => { sent += 1; adapter.calls.textPayloads.push(payload); if (sent === 2) throw new Error("private send failure"); };
   const observer = createHearthChannelOnlyObserver({ adapter, config: { stateDir: path.dirname(tempPath()) }, env: { HEARTH_WEIXIN_MODE: "bridge", HEARTH_WEIXIN_ALLOWED_USER_IDS: "allowed-user" }, logger: createLogger(), bridgeClient: { async request() { return { segments: ["one", "two", "three"] }; } } });
