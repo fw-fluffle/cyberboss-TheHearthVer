@@ -19,7 +19,7 @@ function tempPath() {
 }
 
 function createAdapter() {
-  const calls = { normalize: 0, sendText: 0, sendTyping: 0 };
+  const calls = { normalize: 0, sendText: 0, sendTyping: 0, sendOrder: [], textPayloads: [] };
   return {
     calls,
     normalizeIncomingMessage(message) {
@@ -31,8 +31,8 @@ function createAdapter() {
         contextToken: message.context_token || "",
       };
     },
-    async sendText() { calls.sendText += 1; },
-    async sendTyping() { calls.sendTyping += 1; },
+    async sendText(payload) { calls.sendText += 1; calls.sendOrder.push("text"); calls.textPayloads.push(payload); },
+    async sendTyping() { calls.sendTyping += 1; calls.sendOrder.push("typing"); },
   };
 }
 
@@ -115,6 +115,83 @@ test("allowlisted messages are observed without typing or text sends", async () 
   assert.equal(adapter.calls.sendText, 0);
   assert.equal(adapter.calls.sendTyping, 0);
   assert.equal(logger.lines.length, 1);
+});
+
+test("echo mode sends typing then exactly the fixed bridge reply", async () => {
+  const adapter = createAdapter();
+  const observer = createHearthChannelOnlyObserver({
+    adapter,
+    config: { stateDir: path.dirname(tempPath()) },
+    env: { HEARTH_WEIXIN_MODE: "echo", HEARTH_WEIXIN_ALLOWED_USER_IDS: "allowed-user" },
+    logger: createLogger(),
+  });
+  const result = await observer.processRawMessage(message(), { accountId: "account-1" });
+  assert.equal(result.status, "echoed");
+  assert.deepEqual(adapter.calls.sendOrder, ["typing", "text"]);
+  assert.equal(adapter.calls.textPayloads[0].text, "bridge ok");
+});
+
+test("echo mode never sends for non-allowlisted messages", async () => {
+  const adapter = createAdapter();
+  const observer = createHearthChannelOnlyObserver({
+    adapter,
+    config: { stateDir: path.dirname(tempPath()) },
+    env: { HEARTH_WEIXIN_MODE: "echo" },
+    logger: createLogger(),
+  });
+  assert.equal((await observer.processRawMessage(message(), { accountId: "account-1" })).status, "denied");
+  assert.equal(adapter.calls.sendTyping, 0);
+  assert.equal(adapter.calls.sendText, 0);
+});
+
+test("echo mode deduplicates in process and after ledger reload", async () => {
+  const ledgerPath = tempPath();
+  const env = { HEARTH_WEIXIN_MODE: "echo", HEARTH_WEIXIN_ALLOWED_USER_IDS: "allowed-user" };
+  const firstAdapter = createAdapter();
+  const first = createHearthChannelOnlyObserver({
+    adapter: firstAdapter,
+    config: { stateDir: path.dirname(ledgerPath) }, env, logger: createLogger(),
+    idempotencyStore: new ChannelIdempotencyStore({ filePath: ledgerPath }),
+  });
+  assert.equal((await first.processRawMessage(message(), { accountId: "account-1" })).status, "echoed");
+  assert.equal((await first.processRawMessage(message(), { accountId: "account-1" })).status, "duplicate");
+  const restartedAdapter = createAdapter();
+  const restarted = createHearthChannelOnlyObserver({
+    adapter: restartedAdapter,
+    config: { stateDir: path.dirname(ledgerPath) }, env, logger: createLogger(),
+    idempotencyStore: new ChannelIdempotencyStore({ filePath: ledgerPath }),
+  });
+  assert.equal((await restarted.processRawMessage(message(), { accountId: "account-1" })).status, "duplicate");
+  assert.equal(firstAdapter.calls.sendText, 1);
+  assert.equal(restartedAdapter.calls.sendText, 0);
+});
+
+test("echo sends fixed text after typing failure and does not mark failed text sends", async () => {
+  const adapter = createAdapter();
+  adapter.sendTyping = async () => { adapter.calls.sendTyping += 1; adapter.calls.sendOrder.push("typing"); throw new TypeError("private typing failure"); };
+  const logger = createLogger();
+  const observer = createHearthChannelOnlyObserver({
+    adapter,
+    config: { stateDir: path.dirname(tempPath()) },
+    env: { HEARTH_WEIXIN_MODE: "echo", HEARTH_WEIXIN_ALLOWED_USER_IDS: "allowed-user" },
+    logger,
+  });
+  assert.equal((await observer.processRawMessage(message(), { accountId: "account-1" })).status, "echoed");
+  assert.equal(adapter.calls.sendText, 1);
+  assert.ok(logger.lines.some((line) => line.includes("typing_failed")));
+
+  const failingAdapter = createAdapter();
+  failingAdapter.sendText = async () => { failingAdapter.calls.sendText += 1; throw new Error("private send failure"); };
+  const failing = createHearthChannelOnlyObserver({
+    adapter: failingAdapter,
+    config: { stateDir: path.dirname(tempPath()) },
+    env: { HEARTH_WEIXIN_MODE: "echo", HEARTH_WEIXIN_ALLOWED_USER_IDS: "allowed-user" },
+    logger: createLogger(),
+  });
+  const failedMessage = message({ message_id: "failed" });
+  assert.equal((await failing.processRawMessage(failedMessage, { accountId: "account-1" })).status, "echo_failed");
+  assert.equal((await failing.processRawMessage(failedMessage, { accountId: "account-1" })).status, "echo_failed");
+  assert.equal(failingAdapter.calls.sendText, 2);
 });
 
 test("a malformed message is isolated and does not stop later messages in the batch", async () => {

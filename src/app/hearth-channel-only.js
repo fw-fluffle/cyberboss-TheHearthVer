@@ -86,8 +86,8 @@ function defaultIsProcessAlive(pid) {
 
 function parseObserveConfig(env = process.env) {
   const mode = String(env.HEARTH_WEIXIN_MODE || "observe").trim().toLowerCase() || "observe";
-  if (mode !== "observe") {
-    throw new Error("HEARTH_WEIXIN_MODE only supports observe in Phase 1A");
+  if (mode !== "observe" && mode !== "echo") {
+    throw new Error("HEARTH_WEIXIN_MODE only supports observe or echo");
   }
   const allowedUserIds = new Set(
     String(env.HEARTH_WEIXIN_ALLOWED_USER_IDS || "")
@@ -160,6 +160,37 @@ function createHearthChannelOnlyObserver({
       has_text: Boolean(String(normalized.text || "").trim()),
       has_attachments: Array.isArray(normalized.attachments) && normalized.attachments.length > 0,
     };
+    if (observeConfig.mode === "echo") {
+      await adapter.sendTyping({
+        userId: metadata.sender_id,
+        status: 1,
+        contextToken: normalized.contextToken,
+      }).catch((error) => {
+        logSafe(logger, {
+          type: "hearth_weixin_echo",
+          status: "typing_failed",
+          error_type: safeErrorType(error),
+        });
+      });
+      try {
+        await adapter.sendText({
+          userId: metadata.sender_id,
+          text: "bridge ok",
+          contextToken: normalized.contextToken,
+        });
+      } catch (error) {
+        logSafe(logger, {
+          type: "hearth_weixin_echo",
+          status: "echo_failed",
+          error_type: safeErrorType(error),
+        });
+        return { status: "echo_failed", event: null };
+      }
+      ledger.mark(idempotencyKey, { status: "echoed", recordedAtMs: bridgeReceivedAtMs });
+      logObserve(logger, event, "echoed");
+      return { status: "echoed", event };
+    }
+
     ledger.mark(idempotencyKey, { status: "observed", recordedAtMs: bridgeReceivedAtMs });
     logObserve(logger, event, "observed");
     return { status: "observed", event };
@@ -263,6 +294,11 @@ function shortHash(value) {
   return text ? crypto.createHash("sha256").update(text).digest("hex").slice(0, 12) : "";
 }
 
+function safeErrorType(error) {
+  const name = error instanceof Error ? error.name : typeof error;
+  return /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(name) ? name : "Error";
+}
+
 function cleanText(value) {
   return value == null ? "" : String(value).trim();
 }
@@ -328,6 +364,7 @@ module.exports = {
   createHearthChannelOnlyObserver,
   parseObserveConfig,
   resolveEventTime,
+  safeErrorType,
   shortHash,
   sortRawMessages,
 };
