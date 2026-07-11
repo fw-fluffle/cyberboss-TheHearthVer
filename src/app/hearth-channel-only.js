@@ -1,4 +1,5 @@
 const crypto = require("crypto");
+const fs = require("fs");
 const path = require("path");
 const { readConfig } = require("../core/config");
 const { ChannelIdempotencyStore, hashIdempotencyKey } = require("../core/channel-idempotency-store");
@@ -7,6 +8,81 @@ const DEFAULT_LONG_POLL_TIMEOUT_MS = 35_000;
 const RETRY_DELAY_MS = 2_000;
 const BACKOFF_DELAY_MS = 30_000;
 const MAX_CONSECUTIVE_FAILURES = 3;
+
+function acquireSingleInstanceLock({
+  filePath,
+  pid = process.pid,
+  now = () => Date.now(),
+  isProcessAlive = defaultIsProcessAlive,
+} = {}) {
+  if (!filePath) {
+    throw new Error("Channel-only instance lock requires filePath");
+  }
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const descriptor = fs.openSync(filePath, "wx", 0o600);
+      try {
+        fs.writeFileSync(descriptor, JSON.stringify({ pid, startedAtMs: now() }), "utf8");
+      } finally {
+        fs.closeSync(descriptor);
+      }
+      try {
+        fs.chmodSync(filePath, 0o600);
+      } catch {
+        // Best effort on Windows and restrictive filesystems.
+      }
+
+      let released = false;
+      return {
+        release() {
+          if (released) return;
+          released = true;
+          try {
+            const current = JSON.parse(fs.readFileSync(filePath, "utf8"));
+            if (Number(current?.pid) === Number(pid)) {
+              fs.unlinkSync(filePath);
+            }
+          } catch {
+            // Never remove a lock that cannot be verified as ours.
+          }
+        },
+      };
+    } catch (error) {
+      if (error?.code !== "EEXIST") throw error;
+      const holderPid = readLockPid(filePath);
+      if (holderPid > 0 && isProcessAlive(holderPid)) {
+        throw new Error("Another hearth channel-only sidecar is already running");
+      }
+      try {
+        fs.unlinkSync(filePath);
+      } catch (unlinkError) {
+        if (unlinkError?.code !== "ENOENT") throw unlinkError;
+      }
+    }
+  }
+  throw new Error("Could not acquire hearth channel-only instance lock");
+}
+
+function readLockPid(filePath) {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(filePath, "utf8"));
+    const pid = Number(parsed?.pid);
+    return Number.isSafeInteger(pid) && pid > 0 ? pid : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function defaultIsProcessAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === "EPERM";
+  }
+}
 
 function parseObserveConfig(env = process.env) {
   const mode = String(env.HEARTH_WEIXIN_MODE || "observe").trim().toLowerCase() || "observe";
@@ -202,33 +278,42 @@ function normalizeOrderValue(value) {
 
 async function main() {
   const config = readConfig();
-  const { createWeixinChannelAdapter } = require("../adapters/channel/weixin");
-  const adapter = createWeixinChannelAdapter(config);
-  const observer = createHearthChannelOnlyObserver({ adapter, config });
-  const account = adapter.resolveAccount();
+  const instanceLock = acquireSingleInstanceLock({
+    filePath: path.join(config.stateDir, "hearth-channel-only.lock"),
+  });
   let stopped = false;
   const stop = () => { stopped = true; };
   process.on("SIGINT", stop);
   process.on("SIGTERM", stop);
-  let consecutiveFailures = 0;
+  try {
+    const { createWeixinChannelAdapter } = require("../adapters/channel/weixin");
+    const adapter = createWeixinChannelAdapter(config);
+    const observer = createHearthChannelOnlyObserver({ adapter, config });
+    const account = adapter.resolveAccount();
+    let consecutiveFailures = 0;
 
-  while (!stopped) {
-    try {
-      const response = await adapter.getUpdates({
-        syncBuffer: adapter.loadSyncBuffer(),
-        timeoutMs: DEFAULT_LONG_POLL_TIMEOUT_MS,
-      });
-      consecutiveFailures = 0;
-      await observer.processUpdateResponse(response, account);
-    } catch (error) {
-      consecutiveFailures += 1;
-      logSafe(console, {
-        type: "hearth_weixin_observe",
-        status: "poll_error",
-        retry_delay_ms: consecutiveFailures >= MAX_CONSECUTIVE_FAILURES ? BACKOFF_DELAY_MS : RETRY_DELAY_MS,
-      });
-      await sleep(consecutiveFailures >= MAX_CONSECUTIVE_FAILURES ? BACKOFF_DELAY_MS : RETRY_DELAY_MS);
+    while (!stopped) {
+      try {
+        const response = await adapter.getUpdates({
+          syncBuffer: adapter.loadSyncBuffer(),
+          timeoutMs: DEFAULT_LONG_POLL_TIMEOUT_MS,
+        });
+        consecutiveFailures = 0;
+        await observer.processUpdateResponse(response, account);
+      } catch (error) {
+        consecutiveFailures += 1;
+        logSafe(console, {
+          type: "hearth_weixin_observe",
+          status: "poll_error",
+          retry_delay_ms: consecutiveFailures >= MAX_CONSECUTIVE_FAILURES ? BACKOFF_DELAY_MS : RETRY_DELAY_MS,
+        });
+        await sleep(consecutiveFailures >= MAX_CONSECUTIVE_FAILURES ? BACKOFF_DELAY_MS : RETRY_DELAY_MS);
+      }
     }
+  } finally {
+    process.off("SIGINT", stop);
+    process.off("SIGTERM", stop);
+    instanceLock.release();
   }
 }
 
@@ -237,6 +322,7 @@ function sleep(ms) {
 }
 
 module.exports = {
+  acquireSingleInstanceLock,
   buildRawMetadata,
   compareRawMessages,
   createHearthChannelOnlyObserver,

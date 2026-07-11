@@ -6,6 +6,7 @@ const path = require("path");
 
 const { ChannelIdempotencyStore, MAX_ENTRIES, MAX_ENTRY_AGE_MS } = require("../src/core/channel-idempotency-store");
 const {
+  acquireSingleInstanceLock,
   createHearthChannelOnlyObserver,
   parseObserveConfig,
   resolveEventTime,
@@ -59,6 +60,35 @@ test("observe configuration defaults to observe and deny all", () => {
   assert.equal(parsed.mode, "observe");
   assert.equal(parsed.allowedUserIds.size, 0);
   assert.throws(() => parseObserveConfig({ HEARTH_WEIXIN_MODE: "send" }));
+});
+
+test("single-instance lock rejects a live holder and releases its own lock", () => {
+  const lockPath = path.join(path.dirname(tempPath()), "sidecar.lock");
+  const first = acquireSingleInstanceLock({
+    filePath: lockPath,
+    pid: 101,
+    isProcessAlive: (pid) => pid === 101,
+  });
+  assert.throws(() => acquireSingleInstanceLock({
+    filePath: lockPath,
+    pid: 202,
+    isProcessAlive: (pid) => pid === 101,
+  }), /already running/);
+  first.release();
+  assert.equal(fs.existsSync(lockPath), false);
+});
+
+test("single-instance lock replaces a stale or corrupt lock", () => {
+  const lockPath = path.join(path.dirname(tempPath()), "sidecar.lock");
+  fs.writeFileSync(lockPath, "not-json", "utf8");
+  const lock = acquireSingleInstanceLock({
+    filePath: lockPath,
+    pid: 303,
+    isProcessAlive: () => false,
+  });
+  const stored = JSON.parse(fs.readFileSync(lockPath, "utf8"));
+  assert.equal(stored.pid, 303);
+  lock.release();
 });
 
 test("non-allowlisted messages are denied before normalization", async () => {
