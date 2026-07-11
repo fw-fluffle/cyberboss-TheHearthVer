@@ -3,6 +3,7 @@ const fs = require("fs");
 const path = require("path");
 const { readConfig } = require("../core/config");
 const { ChannelIdempotencyStore, hashIdempotencyKey } = require("../core/channel-idempotency-store");
+const { createHearthBridgeClient } = require("../core/hearth-bridge-client");
 
 const DEFAULT_LONG_POLL_TIMEOUT_MS = 35_000;
 const RETRY_DELAY_MS = 2_000;
@@ -86,8 +87,8 @@ function defaultIsProcessAlive(pid) {
 
 function parseObserveConfig(env = process.env) {
   const mode = String(env.HEARTH_WEIXIN_MODE || "observe").trim().toLowerCase() || "observe";
-  if (mode !== "observe" && mode !== "echo") {
-    throw new Error("HEARTH_WEIXIN_MODE only supports observe or echo");
+  if (!["observe", "echo", "bridge"].includes(mode)) {
+    throw new Error("HEARTH_WEIXIN_MODE only supports observe, echo or bridge");
   }
   const allowedUserIds = new Set(
     String(env.HEARTH_WEIXIN_ALLOWED_USER_IDS || "")
@@ -103,6 +104,7 @@ function createHearthChannelOnlyObserver({
   config,
   env = process.env,
   idempotencyStore,
+  bridgeClient,
   logger = console,
   now = () => Date.now(),
 } = {}) {
@@ -110,6 +112,7 @@ function createHearthChannelOnlyObserver({
     throw new Error("Hearth channel-only observer requires a channel adapter");
   }
   const observeConfig = parseObserveConfig(env);
+  const bridge = observeConfig.mode === "bridge" ? (bridgeClient || createHearthBridgeClient({ env })) : null;
   const ledger = idempotencyStore || new ChannelIdempotencyStore({
     filePath: path.join(config?.stateDir || process.cwd(), "hearth-channel-idempotency.json"),
     now,
@@ -159,6 +162,7 @@ function createHearthChannelOnlyObserver({
       ...metadata,
       has_text: Boolean(String(normalized.text || "").trim()),
       has_attachments: Array.isArray(normalized.attachments) && normalized.attachments.length > 0,
+      text: String(normalized.text || ""),
     };
     if (observeConfig.mode === "echo") {
       await adapter.sendTyping({
@@ -189,6 +193,27 @@ function createHearthChannelOnlyObserver({
       ledger.mark(idempotencyKey, { status: "echoed", recordedAtMs: bridgeReceivedAtMs });
       logObserve(logger, event, "echoed");
       return { status: "echoed", event };
+    }
+
+    if (observeConfig.mode === "bridge") {
+      await adapter.sendTyping({ userId: metadata.sender_id, status: 1, contextToken: normalized.contextToken }).catch((error) => {
+        logSafe(logger, { type: "hearth_weixin_bridge", status: "typing_failed", error_type: safeErrorType(error) });
+      });
+      let response;
+      try { response = await bridge.request(event); } catch (error) {
+        logSafe(logger, { type: "hearth_weixin_bridge", status: "bridge_failed", error_type: safeErrorType(error), error_code: safeErrorCode(error) });
+        return { status: "bridge_failed", event: null };
+      }
+      try {
+        for (const segment of response.segments) await adapter.sendText({ userId: metadata.sender_id, text: segment, contextToken: normalized.contextToken });
+      } catch (error) {
+        logSafe(logger, { type: "hearth_weixin_bridge", status: "delivery_failed", error_type: safeErrorType(error) });
+        return { status: "delivery_failed", event: null };
+      }
+      const assistantSentAt = new Date(now()).toISOString();
+      ledger.mark(idempotencyKey, { status: "delivered", recordedAtMs: Date.parse(assistantSentAt) });
+      logObserve(logger, event, "delivered");
+      return { status: "delivered", event: { ...event, assistant_sent_at: assistantSentAt } };
     }
 
     ledger.mark(idempotencyKey, { status: "observed", recordedAtMs: bridgeReceivedAtMs });
@@ -298,6 +323,8 @@ function safeErrorType(error) {
   const name = error instanceof Error ? error.name : typeof error;
   return /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(name) ? name : "Error";
 }
+
+function safeErrorCode(error) { const code = String(error?.code || ""); return /^[a-z0-9_]{1,32}$/.test(code) ? code : ""; }
 
 function cleanText(value) {
   return value == null ? "" : String(value).trim();

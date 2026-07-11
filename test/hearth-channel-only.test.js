@@ -5,6 +5,7 @@ const os = require("os");
 const path = require("path");
 
 const { ChannelIdempotencyStore, MAX_ENTRIES, MAX_ENTRY_AGE_MS } = require("../src/core/channel-idempotency-store");
+const { buildChannelEnvelope, createHearthBridgeClient, pseudonym, validateBridgeResponse } = require("../src/core/hearth-bridge-client");
 const {
   acquireSingleInstanceLock,
   createHearthChannelOnlyObserver,
@@ -129,6 +130,39 @@ test("echo mode sends typing then exactly the fixed bridge reply", async () => {
   assert.equal(result.status, "echoed");
   assert.deepEqual(adapter.calls.sendOrder, ["typing", "text"]);
   assert.equal(adapter.calls.textPayloads[0].text, "bridge ok");
+});
+
+test("bridge envelope is stable, pseudonymous and excludes context token", () => {
+  const event = { account_id: "account", sender_id: "sender", message_id: "m1", text: "private", event_time: 1000, bridge_received_at: new Date(1000).toISOString(), seq: 2, client_id: "c" };
+  const envelope = buildChannelEnvelope(event, "secret");
+  assert.equal(envelope.channel, "weixin"); assert.equal(envelope.bubble_count, 1); assert.equal(envelope.message_id, "m1");
+  assert.ok(!JSON.stringify(envelope).includes("context_token")); assert.ok(!JSON.stringify(envelope).includes("account\""));
+  assert.equal(pseudonym("sender", "secret", "wu"), envelope.sender_id); assert.notEqual(pseudonym("other", "secret", "wu"), envelope.sender_id);
+});
+
+test("bridge delivers validated segments once and persists delivered", async () => {
+  const adapter = createAdapter(); const ledgerPath = tempPath(); let requests = 0;
+  const observer = createHearthChannelOnlyObserver({ adapter, config: { stateDir: path.dirname(ledgerPath) }, env: { HEARTH_WEIXIN_MODE: "bridge", HEARTH_WEIXIN_ALLOWED_USER_IDS: "allowed-user" }, logger: createLogger(), idempotencyStore: new ChannelIdempotencyStore({ filePath: ledgerPath }), bridgeClient: { async request() { requests += 1; return { segments: ["one", "two"] }; } } });
+  assert.equal((await observer.processRawMessage(message(), { accountId: "account-1" })).status, "delivered");
+  assert.deepEqual(adapter.calls.sendOrder, ["typing", "text", "text"]); assert.deepEqual(adapter.calls.textPayloads.map((p) => p.text), ["one", "two"]);
+  assert.equal((await observer.processRawMessage(message(), { accountId: "account-1" })).status, "duplicate"); assert.equal(requests, 1);
+  const restart = createHearthChannelOnlyObserver({ adapter: createAdapter(), config: { stateDir: path.dirname(ledgerPath) }, env: { HEARTH_WEIXIN_MODE: "bridge", HEARTH_WEIXIN_ALLOWED_USER_IDS: "allowed-user" }, logger: createLogger(), idempotencyStore: new ChannelIdempotencyStore({ filePath: ledgerPath }), bridgeClient: { async request() { throw new Error("should not call"); } } });
+  assert.equal((await restart.processRawMessage(message(), { accountId: "account-1" })).status, "duplicate");
+});
+
+test("bridge validation and failures never deliver partial invalid responses", async () => {
+  assert.throws(() => validateBridgeResponse({ action: "send", reply_text: "a", segments: ["b"] }));
+  const adapter = createAdapter(); const observer = createHearthChannelOnlyObserver({ adapter, config: { stateDir: path.dirname(tempPath()) }, env: { HEARTH_WEIXIN_MODE: "bridge", HEARTH_WEIXIN_ALLOWED_USER_IDS: "allowed-user" }, logger: createLogger(), bridgeClient: { async request() { throw Object.assign(new Error("timeout"), { code: "timeout" }); } } });
+  assert.equal((await observer.processRawMessage(message(), { accountId: "account-1" })).status, "bridge_failed"); assert.equal(adapter.calls.sendText, 0);
+});
+
+test("bridge fails closed without secrets and stops after a segment send failure", async () => {
+  assert.throws(() => createHearthBridgeClient({ env: {} }), /incomplete/);
+  const adapter = createAdapter(); let sent = 0;
+  adapter.sendText = async (payload) => { sent += 1; adapter.calls.textPayloads.push(payload); if (sent === 2) throw new Error("private send failure"); };
+  const observer = createHearthChannelOnlyObserver({ adapter, config: { stateDir: path.dirname(tempPath()) }, env: { HEARTH_WEIXIN_MODE: "bridge", HEARTH_WEIXIN_ALLOWED_USER_IDS: "allowed-user" }, logger: createLogger(), bridgeClient: { async request() { return { segments: ["one", "two", "three"] }; } } });
+  assert.equal((await observer.processRawMessage(message(), { accountId: "account-1" })).status, "delivery_failed");
+  assert.equal(sent, 2);
 });
 
 test("echo mode never sends for non-allowlisted messages", async () => {
