@@ -137,8 +137,10 @@ External services contacted: **none** (no real WeChat / model / Supabase / remot
 
 ## 12. Commit / Push
 
-- Commit message: `feat: connect sidecar to Hearth companion endpoint`
-- See live git status after commit/push
+- Commit: `08ff10f feat: connect sidecar to Hearth companion endpoint`
+- Push: ordinary `git push origin HEAD` succeeded (`373ab17..08ff10f` → `feat/hearth-weixin-sidecar-v0`)
+- Branch aligned with origin
+- No tokens / `.env` / persona text committed
 
 ## 13. Known Limitations
 
