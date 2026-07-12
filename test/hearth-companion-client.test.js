@@ -158,14 +158,101 @@ test("envelope mapping is pseudonymous and excludes context_token and raw payloa
   assert.ok(envelope.event_time.includes("T"));
   assert.equal(envelope.bridge_received_at, "2026-07-12T21:30:01+08:00");
   assert.equal(envelope.raw_metadata.seq, "9");
-  assert.equal(envelope.raw_metadata.client_id, "cid");
+  assert.equal(envelope.raw_metadata.client_id, pseudonym("cid", "secret", "wcid"));
   assert.equal(envelope.sender_id, pseudonym("sender-raw", "secret", "wu"));
   assert.equal(envelope.account_id, pseudonym("account-raw", "secret", "wa"));
   assert.ok(!serialized.includes("context_token"));
   assert.ok(!serialized.includes("must-not-appear"));
   assert.ok(!serialized.includes("account-raw"));
   assert.ok(!serialized.includes("sender-raw"));
+  assert.ok(!serialized.includes("\"cid\""));
   assert.ok(!serialized.includes("raw_weixin"));
+});
+
+test("envelope raw_metadata.client_id is HMAC-pseudonymized under Gateway length cap", () => {
+  const secret = "test-pseudonym-secret";
+  const longClientId = `ilink-real-client-id-${"x".repeat(80)}`;
+  assert.ok(longClientId.length > 64);
+
+  const envelope = buildChannelEnvelope(
+    {
+      account_id: "account-raw",
+      sender_id: "sender-raw",
+      message_id: "m-long-cid",
+      text: "hello",
+      event_time: 1_720_000_000_000,
+      bridge_received_at: "2026-07-12T21:30:01+08:00",
+      seq: 1,
+      client_id: longClientId,
+    },
+    secret,
+  );
+  const outgoing = envelope.raw_metadata.client_id;
+  assert.equal(outgoing, pseudonym(longClientId, secret, "wcid"));
+  assert.ok(outgoing.startsWith("wcid_"));
+  assert.ok(outgoing.length < 64);
+  assert.ok(!JSON.stringify(envelope).includes(longClientId));
+
+  const again = buildChannelEnvelope(
+    {
+      account_id: "account-raw",
+      sender_id: "sender-raw",
+      message_id: "m-long-cid",
+      text: "hello",
+      event_time: 1_720_000_000_000,
+      bridge_received_at: "2026-07-12T21:30:01+08:00",
+      seq: 1,
+      client_id: longClientId,
+    },
+    secret,
+  );
+  assert.equal(again.raw_metadata.client_id, outgoing);
+
+  const otherInput = buildChannelEnvelope(
+    {
+      account_id: "account-raw",
+      sender_id: "sender-raw",
+      message_id: "m-long-cid",
+      text: "hello",
+      event_time: 1_720_000_000_000,
+      bridge_received_at: "2026-07-12T21:30:01+08:00",
+      seq: 1,
+      client_id: `${longClientId}-b`,
+    },
+    secret,
+  );
+  assert.notEqual(otherInput.raw_metadata.client_id, outgoing);
+
+  const otherSecret = buildChannelEnvelope(
+    {
+      account_id: "account-raw",
+      sender_id: "sender-raw",
+      message_id: "m-long-cid",
+      text: "hello",
+      event_time: 1_720_000_000_000,
+      bridge_received_at: "2026-07-12T21:30:01+08:00",
+      seq: 1,
+      client_id: longClientId,
+    },
+    "other-secret",
+  );
+  assert.notEqual(otherSecret.raw_metadata.client_id, outgoing);
+
+  const emptyEnvelope = buildChannelEnvelope(
+    {
+      account_id: "account-raw",
+      sender_id: "sender-raw",
+      message_id: "m-empty-cid",
+      text: "hello",
+      event_time: 1_720_000_000_000,
+      bridge_received_at: "2026-07-12T21:30:01+08:00",
+      seq: 1,
+      client_id: "   ",
+    },
+    secret,
+  );
+  assert.equal("client_id" in emptyEnvelope.raw_metadata, false);
+  assert.ok(!JSON.stringify(emptyEnvelope.raw_metadata).includes("wcid_"));
 });
 
 test("real client posts Authorization bearer and never logs secrets", async () => {

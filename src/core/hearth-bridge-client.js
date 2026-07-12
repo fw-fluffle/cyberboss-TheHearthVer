@@ -140,6 +140,16 @@ function buildChannelEnvelope(event, secret) {
   const accountId = pseudonym(event.account_id, secret, "wa");
   const senderId = pseudonym(event.sender_id, secret, "wu");
   // context_token / 原始微信 payload / 时间戳正文拼接：全部禁止进 Envelope。
+  // client_id：只对发往 Hearth 的 raw_metadata 做 HMAC 伪名（wcid_ + 24hex ≈ 29 字），
+  // 绝不截断原值、绝不明文透传；空值则省略字段（不生成空伪名）。
+  // Sidecar 本地幂等键仍用原始 client_id，本函数碰不到那一层。
+  const rawMetadata = {
+    seq: String(event.seq || ""),
+  };
+  const clientIdRaw = String(event.client_id || "").trim();
+  if (clientIdRaw) {
+    rawMetadata.client_id = pseudonym(clientIdRaw, secret, "wcid");
+  }
   return {
     channel: "weixin",
     account_id: accountId,
@@ -150,10 +160,7 @@ function buildChannelEnvelope(event, secret) {
     text: String(event.text || ""),
     event_time: new Date(event.event_time).toISOString(),
     bridge_received_at: event.bridge_received_at,
-    raw_metadata: {
-      seq: String(event.seq || ""),
-      client_id: String(event.client_id || ""),
-    },
+    raw_metadata: rawMetadata,
     bubble_count: 1,
   };
 }
