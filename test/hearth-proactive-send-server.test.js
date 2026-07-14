@@ -281,6 +281,35 @@ test("valid request calls adapter.sendText and returns assistant_sent_at only af
     assert.equal(adapter.calls.payloads[0].userId, "owner-user");
     assert.equal(adapter.calls.payloads[0].contextToken, "ctx-token-abc");
     assert.match(adapter.calls.payloads[0].text, /Active Line v0/);
+    // 未传 preserveBlock：保持默认 false，普通分段路径不被关掉。
+    assert.equal(adapter.calls.payloads[0].preserveBlock, false);
+  });
+});
+
+test("preserveBlock true is forwarded; omitted field stays default false", async () => {
+  const adapter = createFakeAdapter();
+  const handler = createProactiveSendRequestHandler({
+    adapter,
+    config: { allowedUserIds: ["owner-user"] },
+    controlToken: CONTROL_TOKEN,
+    logger: createLogger(),
+  });
+  await withServer(handler, async ({ baseUrl }) => {
+    const omitted = await postSend({
+      baseUrl,
+      token: CONTROL_TOKEN,
+      body: validBody({ request_id: "preserve-default-1" }),
+    });
+    assert.equal(omitted.json.status, "sent");
+    assert.equal(adapter.calls.payloads[0].preserveBlock, false);
+
+    const explicit = await postSend({
+      baseUrl,
+      token: CONTROL_TOKEN,
+      body: validBody({ request_id: "preserve-true-1", preserveBlock: true }),
+    });
+    assert.equal(explicit.json.status, "sent");
+    assert.equal(adapter.calls.payloads[1].preserveBlock, true);
   });
 });
 

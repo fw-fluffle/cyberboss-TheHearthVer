@@ -347,6 +347,8 @@ function createProactiveSendRequestHandler({
     const target = typeof body?.target === "string" ? body.target.trim() : "";
     const text = typeof body?.text === "string" ? body.text : "";
     const source = typeof body?.source === "string" ? body.source.trim() : "";
+    // Active Line 主动消息可显式要求整块发送；缺省 false，普通聊天切分逻辑完全不动。
+    const preserveBlock = body?.preserveBlock === true;
     const textLength = Buffer.byteLength(text, "utf8");
 
     const baseLog = {
@@ -355,6 +357,7 @@ function createProactiveSendRequestHandler({
       source: source || undefined,
       text_length: textLength,
       target: target || "unknown",
+      preserve_block: preserveBlock,
     };
 
     if (!requestId || requestId.length > MAX_REQUEST_ID_LENGTH) {
@@ -466,19 +469,31 @@ function createProactiveSendRequestHandler({
       }
 
       try {
+        // preserveBlock=true：整块递给底层，禁止再被 reply chunker 切成「嗯。」孤儿首段。
+        // false/缺省：继续走 adapter 既有分段，companion 回复不受影响。
         await adapter.sendText({
           userId: senderId,
           text,
           contextToken,
+          preserveBlock,
         });
-      } catch {
+      } catch (error) {
         dedupe.complete(requestId, "failed");
         writeJson(res, httpStatusForBusinessStatus("weixin_send_failed"), {
           ok: false,
           status: "weixin_send_failed",
           request_id: requestId,
         });
-        logControlSafe(logger, { ...baseLog, status: "weixin_send_failed" });
+        // 只留错误类别指纹（ret/errcode/短 errmsg），绝不回灌正文或 token。
+        const errorSafe = String(error?.message || "unknown")
+          .replace(/Bearer\s+\S+/gi, "Bearer ***")
+          .replace(/context_token[=:]\s*\S+/gi, "context_token=***")
+          .slice(0, 240);
+        logControlSafe(logger, {
+          ...baseLog,
+          status: "weixin_send_failed",
+          error_safe: errorSafe,
+        });
         return;
       }
 

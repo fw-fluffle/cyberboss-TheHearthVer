@@ -23,9 +23,14 @@ Body:
   "request_id": "active-line-smoke-唯一值",
   "target": "default_owner",
   "text": "Active Line v0：小狼已从 The Hearth 敲到微信窗边。",
-  "source": "dylan_manual_smoke"
+  "source": "dylan_manual_smoke",
+  "preserveBlock": true
 }
 ```
+
+可选字段：
+
+- `preserveBlock`（boolean，默认 `false`）：`true` 时底层 `sendText` 整块发送，不走普通 companion reply 切段。Active Line 手动投递应显式传 `true`；缺省不影响普通聊天分段。
 
 成功：
 
