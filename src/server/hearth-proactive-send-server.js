@@ -148,6 +148,7 @@ function httpStatusForBusinessStatus(status) {
     case "invalid_request":
       return 400;
     case "sidecar_not_ready":
+    case "channel_state_unavailable":
       return 503;
     case "sender_not_found":
     case "context_token_missing":
@@ -159,6 +160,88 @@ function httpStatusForBusinessStatus(status) {
     default:
       return 500;
   }
+}
+
+function resolveHasContextToken({ adapter, config, allowedUserIds }) {
+  if (!adapter || typeof adapter.getKnownContextTokens !== "function") {
+    return false;
+  }
+  let accountId = "";
+  try {
+    accountId = adapter.resolveAccount?.()?.accountId || "";
+  } catch {
+    accountId = "";
+  }
+  const preferredAllowed = resolveAllowedUserIds({ config, allowedUserIds });
+  const senderId = resolvePreferredSenderId({
+    config: {
+      ...config,
+      allowedUserIds: preferredAllowed.length ? preferredAllowed : config?.allowedUserIds,
+    },
+    accountId,
+  });
+  if (!senderId) return false;
+  const tokens = adapter.getKnownContextTokens() || {};
+  const token = typeof tokens[senderId] === "string" ? tokens[senderId].trim() : "";
+  return Boolean(token);
+}
+
+function handleChannelStateGet({
+  req,
+  res,
+  controlToken,
+  adapter,
+  config,
+  allowedUserIds,
+  channelStateStore,
+  isReady = () => true,
+  logger = console,
+}) {
+  const presented = extractBearerToken(req.headers?.authorization);
+  if (!presented || presented !== controlToken) {
+    writeJson(res, httpStatusForBusinessStatus("unauthorized"), {
+      ok: false,
+      status: "unauthorized",
+    });
+    logControlSafe(logger, {
+      type: "hearth_weixin_channel_state",
+      status: "unauthorized",
+    });
+    return;
+  }
+
+  if (!channelStateStore || typeof channelStateStore.getSnapshot !== "function") {
+    writeJson(res, httpStatusForBusinessStatus("channel_state_unavailable"), {
+      ok: false,
+      status: "channel_state_unavailable",
+    });
+    logControlSafe(logger, {
+      type: "hearth_weixin_channel_state",
+      status: "channel_state_unavailable",
+    });
+    return;
+  }
+
+  const snapshot = channelStateStore.getSnapshot() || {};
+  const ready = Boolean(isReady());
+  const hasContextToken = resolveHasContextToken({ adapter, config, allowedUserIds });
+  const body = {
+    ok: true,
+    ready,
+    has_context_token: hasContextToken,
+    last_user_event_time: snapshot.last_user_event_time || null,
+    last_bridge_received_at: snapshot.last_bridge_received_at || null,
+    last_message_id: snapshot.last_message_id || null,
+    updated_at: snapshot.updated_at || null,
+  };
+  writeJson(res, 200, body);
+  logControlSafe(logger, {
+    type: "hearth_weixin_channel_state",
+    status: "ok",
+    ready,
+    has_context_token: hasContextToken,
+    has_last_user_event_time: Boolean(snapshot.last_user_event_time),
+  });
 }
 
 function writeJson(res, httpStatus, body) {
@@ -194,6 +277,7 @@ function createProactiveSendRequestHandler({
   config,
   controlToken,
   allowedUserIds,
+  channelStateStore = null,
   deduper,
   isReady = () => true,
   now = () => Date.now(),
@@ -210,6 +294,22 @@ function createProactiveSendRequestHandler({
   return async function handleProactiveSendRequest(req, res) {
     const method = String(req.method || "").toUpperCase();
     const url = new URL(req.url || "/", "http://127.0.0.1");
+
+    // Active Line v0-C1：只读 channel state，复用同一把 localhost 钥匙。
+    if (method === "GET" && url.pathname === "/internal/channel-state") {
+      handleChannelStateGet({
+        req,
+        res,
+        controlToken,
+        adapter,
+        config,
+        allowedUserIds,
+        channelStateStore,
+        isReady,
+        logger,
+      });
+      return;
+    }
 
     if (method !== "POST" || url.pathname !== "/internal/send") {
       writeJson(res, 404, { ok: false, status: "invalid_request", error: "not_found" });
@@ -416,6 +516,7 @@ function startHearthProactiveSendServer({
   config,
   env = process.env,
   allowedUserIds,
+  channelStateStore = null,
   isReady,
   deduper,
   now = () => Date.now(),
@@ -428,6 +529,7 @@ function startHearthProactiveSendServer({
     config,
     controlToken: plane.controlToken,
     allowedUserIds,
+    channelStateStore,
     deduper: deduper || createProactiveSendDeduper({ ttlMs: plane.ttlMs, now }),
     isReady,
     now,
@@ -483,4 +585,6 @@ module.exports = {
   createProactiveSendRequestHandler,
   startHearthProactiveSendServer,
   httpStatusForBusinessStatus,
+  resolveHasContextToken,
+  handleChannelStateGet,
 };

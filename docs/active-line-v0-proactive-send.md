@@ -55,3 +55,17 @@ Body:
 - 独立 `HEARTH_WEIXIN_CONTROL_TOKEN`，禁止复用 `HEARTH_INTERNAL_TOKEN` / Dashboard / Supabase key
 - 日志只含：`request_id`、`source`、`text_length`、`target`、最终 `status`、`assistant_sent_at`
 - 端口占用时明确失败，不改绑公网、不随机端口
+
+## Channel state（只读）
+
+`GET /internal/channel-state`（同一 localhost 控制面与同一 Bearer）
+
+安全字段：
+
+- `last_user_event_time`：微信 `create_time_ms` / `create_time` 的真实事件时间（只前进）
+- `last_bridge_received_at`：Sidecar 接受处理该入站的抵达时间
+- `last_message_id`：**最后抵达并写入状态的消息 ID**（不是 event_time 最晚的那条；乱序迟到消息会更新此字段，但不会倒退 `last_user_event_time`）
+- `has_context_token`：布尔；不返回 token 原文
+- `ready`：当前通道是否可工作；与历史时间是否存在无关
+
+持久化：`{accountsDir}/{accountId}.hearth-channel-state.json`（无 token / 无正文）

@@ -5,6 +5,7 @@ const { readConfig } = require("../core/config");
 const { ChannelIdempotencyStore, hashIdempotencyKey } = require("../core/channel-idempotency-store");
 const { createHearthBridgeClient, createDryRunDeliverySink } = require("../core/hearth-bridge-client");
 const { startHearthProactiveSendServer } = require("../server/hearth-proactive-send-server");
+const { createHearthChannelStateStore } = require("../adapters/channel/weixin/hearth-channel-state-store");
 
 const DEFAULT_LONG_POLL_TIMEOUT_MS = 35_000;
 const RETRY_DELAY_MS = 2_000;
@@ -106,6 +107,7 @@ function createHearthChannelOnlyObserver({
   config,
   env = process.env,
   idempotencyStore,
+  channelStateStore = null,
   bridgeClient,
   delivery,
   logger = console,
@@ -125,6 +127,26 @@ function createHearthChannelOnlyObserver({
   });
   // 进程内 inflight：同 key 并发第二请求不得再次打 Hearth。
   const inflightKeys = new Set();
+
+  function rememberChannelState(metadata, bridgeReceivedAt) {
+    if (!channelStateStore || typeof channelStateStore.recordInboundUserEvent !== "function") {
+      return;
+    }
+    try {
+      channelStateStore.recordInboundUserEvent({
+        eventTimeMs: metadata.event_time,
+        eventTimeSource: metadata.event_time_source,
+        bridgeReceivedAt,
+        messageId: metadata.message_id,
+      });
+    } catch {
+      // 状态落盘失败不得阻断入站主链。
+      logSafe(logger, {
+        type: "hearth_weixin_channel_state",
+        status: "persist_failed",
+      });
+    }
+  }
 
   async function processRawMessage(rawMessage, account) {
     const bridgeReceivedAtMs = now();
@@ -168,6 +190,9 @@ function createHearthChannelOnlyObserver({
       logObserve(logger, metadata, "malformed");
       return { status: "malformed", event: null };
     }
+
+    // 白名单 + 非重复 + 标准化成功后，才推进真实微信事件时间（防乱序倒退由 store 负责）。
+    rememberChannelState(metadata, bridgeReceivedAt);
 
     const event = {
       ...metadata,
@@ -414,17 +439,22 @@ async function main() {
   try {
     const { createWeixinChannelAdapter } = require("../adapters/channel/weixin");
     const adapter = createWeixinChannelAdapter(config);
-    const observer = createHearthChannelOnlyObserver({ adapter, config });
     // 账号必须先就绪：主动发送控制面要共用这套登录态 / token cache，禁止另起炉灶。
     const account = adapter.resolveAccount();
+    const channelStateStore = createHearthChannelStateStore({
+      config,
+      accountId: account.accountId,
+    });
+    const observer = createHearthChannelOnlyObserver({ adapter, config, channelStateStore });
     const observeConfig = parseObserveConfig(process.env);
 
-    // Active Line v0：同一进程挂 localhost 控制面，Dylan smoke 只敲这扇门。
+    // Active Line v0：同一进程挂 localhost 控制面（send + channel-state）。
     controlPlane = startHearthProactiveSendServer({
       adapter,
       config,
       env: process.env,
       allowedUserIds: observeConfig.allowedUserIds,
+      channelStateStore,
       isReady: () => !stopped && Boolean(account?.accountId),
       logger: console,
     });
