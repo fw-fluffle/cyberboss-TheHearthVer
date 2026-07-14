@@ -4,6 +4,7 @@ const path = require("path");
 const { readConfig } = require("../core/config");
 const { ChannelIdempotencyStore, hashIdempotencyKey } = require("../core/channel-idempotency-store");
 const { createHearthBridgeClient, createDryRunDeliverySink } = require("../core/hearth-bridge-client");
+const { startHearthProactiveSendServer } = require("../server/hearth-proactive-send-server");
 
 const DEFAULT_LONG_POLL_TIMEOUT_MS = 35_000;
 const RETRY_DELAY_MS = 2_000;
@@ -409,11 +410,32 @@ async function main() {
   const stop = () => { stopped = true; };
   process.on("SIGINT", stop);
   process.on("SIGTERM", stop);
+  let controlPlane = null;
   try {
     const { createWeixinChannelAdapter } = require("../adapters/channel/weixin");
     const adapter = createWeixinChannelAdapter(config);
     const observer = createHearthChannelOnlyObserver({ adapter, config });
+    // 账号必须先就绪：主动发送控制面要共用这套登录态 / token cache，禁止另起炉灶。
     const account = adapter.resolveAccount();
+    const observeConfig = parseObserveConfig(process.env);
+
+    // Active Line v0：同一进程挂 localhost 控制面，Dylan smoke 只敲这扇门。
+    controlPlane = startHearthProactiveSendServer({
+      adapter,
+      config,
+      env: process.env,
+      allowedUserIds: observeConfig.allowedUserIds,
+      isReady: () => !stopped && Boolean(account?.accountId),
+      logger: console,
+    });
+    await controlPlane.ready;
+    logSafe(console, {
+      type: "hearth_weixin_proactive_send",
+      status: "control_plane_listening",
+      host: controlPlane.host,
+      port: controlPlane.port,
+    });
+
     let consecutiveFailures = 0;
 
     while (!stopped) {
@@ -437,6 +459,13 @@ async function main() {
   } finally {
     process.off("SIGINT", stop);
     process.off("SIGTERM", stop);
+    if (controlPlane) {
+      try {
+        await controlPlane.close();
+      } catch {
+        // 关控制面失败也不要挡住锁释放；进程反正要退场了。
+      }
+    }
     instanceLock.release();
   }
 }
