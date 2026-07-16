@@ -329,8 +329,8 @@ test("channel-only module does not load CyberbossApp or runtime/tooling modules"
   assert.ok(!loaded.includes("src/tools/create-project-tooling"));
 });
 
-test("the existing default start entry remains unchanged", () => {
+test("channel-only loads local env without changing the existing default start entry", () => {
   const packageJson = JSON.parse(fs.readFileSync(path.resolve(__dirname, "..", "package.json"), "utf8"));
   assert.equal(packageJson.scripts.start, "node ./bin/cyberboss.js start");
-  assert.equal(packageJson.scripts["hearth:channel-only"], "node ./src/app/hearth-channel-only.js");
+  assert.equal(packageJson.scripts["hearth:channel-only"], "node -r dotenv/config ./src/app/hearth-channel-only.js");
 });

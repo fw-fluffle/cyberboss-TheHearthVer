@@ -19,7 +19,7 @@
     "accounts": "node ./bin/cyberboss.js accounts",
     "doctor": "node ./bin/cyberboss.js doctor",
     "help": "node ./bin/cyberboss.js help",
-    "hearth:channel-only": "node ./src/app/hearth-channel-only.js",
+    "hearth:channel-only": "node -r dotenv/config ./src/app/hearth-channel-only.js",
     "shared:start": "node ./scripts/shared-start.js",
     "shared:open": "node ./scripts/shared-open.js",
     "shared:status": "node ./scripts/shared-status.js",
