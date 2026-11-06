@@ -22,15 +22,16 @@ const env = {
 
 async function exercise({
   segments = [], format = "gif", fault = "", deliveryEnabled = true,
-  dryRun = false, includeSticker = true, replay = false,
+  dryRun = false, includeSticker = true, replay = false, history = false,
 } = {}) {
   const image = images[format];
   const digest = crypto.createHash("sha256").update(image).digest("hex");
   const sticker = { id: "small_rabbit", mime_type: `image/${format}`, sha256: digest,
     ticket: `1800000000.${digest}.${format}.${"c".repeat(64)}` };
+  if (history) sticker.history_receipt = `1800000000.23.11111111-2222-4333-8444-555555555555.${"a".repeat(64)}`;
   const requests = [], sent = [], ledger = [];
   const seen = new Set();
-  let file;
+  let file, receiptAttempts = 0;
   const runEnv = { ...env, HEARTH_WEIXIN_STICKER_DELIVERY: deliveryEnabled ? "1" : "0",
     HEARTH_WEIXIN_MODE: dryRun ? "bridge_dry_run" : "bridge" };
   const bridge = createHearthBridgeClient({ env: runEnv, fetchImpl: async (url, options) => {
@@ -41,9 +42,17 @@ async function exercise({
     }
     if (url.pathname === "/internal/channel/companion") {
       assert.equal(options.headers["X-Hearth-Sticker-Delivery"], deliveryEnabled ? "v1" : undefined);
+      if (history) assert.equal(options.headers["X-Hearth-Sticker-History"], "v1");
       const body = { action: "send", reply_text: segments.join("\n\n"), segments };
       if (includeSticker) body.sticker = fault === "bad_id" ? { ...sticker, id: "../anywhere" } : sticker;
       return Response.json(body);
+    }
+    if (url.pathname.endsWith("/delivered")) {
+      assert.equal(options.method, "POST");
+      assert.equal(options.headers["X-Hearth-Sticker-Receipt"], sticker.history_receipt);
+      assert.equal(sent.at(-1), format.toUpperCase());
+      assert.equal(ledger.at(-1), "delivered");
+      return new Response(null, { status: ++receiptAttempts === 1 ? 503 : 204 });
     }
     assert.equal(url.pathname, "/internal/channel/stickers/small_rabbit/image");
     assert.equal(url.search, "");
@@ -135,4 +144,16 @@ test("unexpected, unverified or unsuccessfully sent stickers do not record deliv
   assert.equal(result.status, "bridged_dry_run");
   assert.deepEqual(sent, []);
   assert.deepEqual(ledger, ["bridged_dry_run"]);
+});
+
+test("history receipt is sent after image delivery and only the receipt retries", async () => {
+  const { result, repeated, requests, sent } = await exercise({ history: true, replay: true });
+  assert.equal(result.status, "delivered");
+  assert.equal(repeated.status, "duplicate");
+  assert.deepEqual(sent, ["GIF"]);
+  assert.equal(requests.filter(url => url.endsWith("/delivered")).length, 2);
+  for (const options of [{ fault: "adapter", segments: ["文字"] }, { dryRun: true }]) {
+    const attempt = await exercise({ ...options, history: true });
+    assert.equal(attempt.requests.filter(url => url.endsWith("/delivered")).length, 0);
+  }
 });

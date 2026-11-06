@@ -350,6 +350,13 @@ function createHearthChannelOnlyObserver({
         });
         logObserve(logger, record.event, deliveryStatus);
       });
+      if (deliveryStatus === "delivered" && sticker?.history_receipt) {
+        try {
+          await bridge.reportStickerDelivery(sticker);
+        } catch {
+          logSafe(logger, { type: "hearth_weixin_bridge", status: "sticker_history_receipt_failed" });
+        }
+      }
       return {
         status: deliveryStatus,
         event: { ...aggregate, assistant_sent_at: assistantSentAt },

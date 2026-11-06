@@ -8,6 +8,7 @@ const MAX_BYTES = 8 * 1024 * 1024;
 const ID = /^[a-z][a-z0-9_]{0,39}$/;
 const SHA = /^[a-f0-9]{64}$/;
 const TICKET = /^\d{1,12}\.[a-f0-9]{64}\.(jpg|png|gif)\.[a-f0-9]{64}$/;
+const HISTORY_RECEIPT = /^\d{1,12}\.[1-9]\d{0,18}\.[a-f0-9-]{36}\.[a-f0-9]{64}$/;
 
 function invalidSticker() {
   return Object.assign(new Error("Bridge sticker delivery invalid"), { code: "invalid_sticker_delivery" });
@@ -15,12 +16,15 @@ function invalidSticker() {
 
 function validateStickerDelivery(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)
-      || Object.keys(value).sort().join(",") !== "id,mime_type,sha256,ticket"
+      || !["id,mime_type,sha256,ticket", "history_receipt,id,mime_type,sha256,ticket"]
+        .includes(Object.keys(value).sort().join(","))
       || typeof value.id !== "string" || !ID.test(value.id)
       || typeof value.sha256 !== "string" || !SHA.test(value.sha256)
       || typeof value.mime_type !== "string" || !Object.hasOwn(EXTENSIONS, value.mime_type)
-      || typeof value.ticket !== "string" || !TICKET.test(value.ticket)) throw invalidSticker();
-  return { id: value.id, mime_type: value.mime_type, sha256: value.sha256, ticket: value.ticket };
+      || typeof value.ticket !== "string" || !TICKET.test(value.ticket)
+      || (Object.hasOwn(value, "history_receipt") && (typeof value.history_receipt !== "string"
+          || !HISTORY_RECEIPT.test(value.history_receipt)))) throw invalidSticker();
+  return { ...value };
 }
 
 async function readStickerBytes(response, sticker) {
