@@ -53,6 +53,26 @@ function createHearthBridgeClient({
         return await readStickerBytes(response, sticker);
       } finally { clearTimeout(timer); }
     },
+    async reportStickerDelivery(value) {
+      if (!stickerDelivery) throw invalidSticker();
+      const sticker = validateStickerDelivery(value);
+      if (!sticker.history_receipt) return;
+      const receiptUrl = new URL(`/internal/channel/stickers/${sticker.id}/delivered`, url);
+      for (let attempt = 0; attempt < 2; attempt++) {
+        let response;
+        try {
+          response = await fetchImpl(receiptUrl, {
+            method: "POST", redirect: "error", signal: AbortSignal.timeout(5000),
+            headers: { Authorization: `Bearer ${token}`, "X-Hearth-Sticker-Receipt": sticker.history_receipt },
+          });
+        } catch {
+          continue;
+        }
+        if (response.status === 204) return;
+        if (response.status < 500 && response.status !== 429) break;
+      }
+      throw Object.assign(new Error("Sticker history receipt unavailable"), { code: "sticker_history_receipt_failed" });
+    },
     async getRuntimeConfig() {
       const configUrl = new URL(url.toString());
       configUrl.pathname = RUNTIME_CONFIG_PATH;
@@ -90,7 +110,7 @@ function createHearthBridgeClient({
           headers: {
             Authorization: `Bearer ${token}`,
             "Content-Type": "application/json",
-            ...(stickerDelivery ? { "X-Hearth-Sticker-Delivery": "v1" } : {}),
+            ...(stickerDelivery ? { "X-Hearth-Sticker-Delivery": "v1", "X-Hearth-Sticker-History": "v1" } : {}),
           },
           body: JSON.stringify(envelope),
           signal: controller.signal,
