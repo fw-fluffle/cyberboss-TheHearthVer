@@ -4,6 +4,7 @@ const path = require("path");
 const { readConfig } = require("../core/config");
 const { ChannelIdempotencyStore, hashIdempotencyKey } = require("../core/channel-idempotency-store");
 const { createHearthBridgeClient, createDryRunDeliverySink } = require("../core/hearth-bridge-client");
+const { invalidSticker, withStickerFile } = require("../core/hearth-sticker-delivery");
 const { startHearthProactiveSendServer } = require("../server/hearth-proactive-send-server");
 const { createHearthChannelStateStore } = require("../adapters/channel/weixin/hearth-channel-state-store");
 const { persistIncomingWeixinAttachments } = require("../adapters/channel/weixin/media-receive");
@@ -12,6 +13,9 @@ const DEFAULT_LONG_POLL_TIMEOUT_MS = 35_000;
 const RETRY_DELAY_MS = 2_000;
 const BACKOFF_DELAY_MS = 30_000;
 const MAX_CONSECUTIVE_FAILURES = 3;
+// 微信发送接口如果在同一眨眼里连收几泡，客户端可能把它们压成一只带空行的大气泡。
+// 650ms 只放在哥哥“泡与泡之间”：单泡不罚站，最后一泡也不拖着尾巴睡觉。
+const WEIXIN_OUTBOUND_BUBBLE_INTERVAL_MS = 650;
 const MAX_BRIDGE_IMAGES = 4;
 const MAX_BRIDGE_IMAGE_BYTES = 10 * 1024 * 1024;
 const MAX_BRIDGE_IMAGE_TOTAL_BYTES = 20 * 1024 * 1024;
@@ -134,6 +138,7 @@ function createHearthChannelOnlyObserver({
   delivery,
   logger = console,
   now = () => Date.now(),
+  sleepFn = sleep,
 } = {}) {
   if (!adapter) {
     throw new Error("Hearth channel-only observer requires a channel adapter");
@@ -255,15 +260,29 @@ function createHearthChannelOnlyObserver({
           });
         } else {
           // Gateway 已经切好展示气泡；Sidecar 只做平台硬上限保护，不再二次按句号切菜。
-          for (const segment of response.segments) {
+          // 注意：adapter 内部 350ms 只管“同一泡超长后的硬切块”，管不到这里的独立泡。
+          // 所以间隔必须住在外层循环；否则三个单泡会像赶末班车一样同时撞进微信。
+          for (let index = 0; index < response.segments.length; index += 1) {
+            const segment = response.segments[index];
             await adapter.sendText({
               userId: latest.metadata.sender_id,
               text: segment,
               contextToken: latest.normalized.contextToken,
               preserveBlock: true,
             });
+            if (index < response.segments.length - 1) {
+              await sleepFn(WEIXIN_OUTBOUND_BUBBLE_INTERVAL_MS);
+            }
           }
         }
+        // 只记“发了几泡”和固定间隔，不记哥哥正文；以后再遇到一只大气泡，
+        // 值班小机一眼就能分清“Gateway 只切一泡”还是“微信把多泡粘起来”。
+        logSafe(logger, {
+          type: "hearth_weixin_bridge",
+          status: "segments_delivered",
+          outbound_segment_count: response.segments.length,
+          bubble_interval_ms: WEIXIN_OUTBOUND_BUBBLE_INTERVAL_MS,
+        });
       } catch (error) {
         logSafe(logger, {
           type: "hearth_weixin_bridge",
@@ -272,6 +291,38 @@ function createHearthChannelOnlyObserver({
           bubble_count: records.length,
         });
         return { status: "delivery_failed", event: null };
+      }
+
+      const sticker = response.sticker;
+      let deliveryStatus = "delivered";
+      let deliveredAtMs;
+      if (sticker) {
+        const textSentAtMs = now();
+        try {
+          if (!observeConfig.dryRun && (deliver
+            ? typeof deliver.deliverSticker !== "function" || typeof deliver.deliverSegments !== "function"
+            : typeof adapter.sendFile !== "function")) throw invalidSticker();
+          const bytes = await bridge.readSticker(sticker);
+          if (observeConfig.dryRun) {
+            await dryRunSink.deliverSticker?.({ id: sticker.id });
+          } else {
+            const recipient = { userId: latest.metadata.sender_id, contextToken: latest.normalized.contextToken };
+            await withStickerFile(sticker, bytes, filePath => deliver
+              ? deliver.deliverSticker({ ...recipient, filePath })
+              : adapter.sendFile({ ...recipient, filePath }));
+          }
+        } catch (error) {
+          logSafe(logger, {
+            type: "hearth_weixin_bridge",
+            status: "sticker_delivery_failed",
+            error_type: safeErrorType(error),
+          });
+          if (observeConfig.dryRun || !response.segments.length) {
+            return { status: "delivery_failed", event: null };
+          }
+          deliveryStatus = "partial_delivery";
+          deliveredAtMs = textSentAtMs;
+        }
       }
 
       if (observeConfig.dryRun) {
@@ -291,16 +342,16 @@ function createHearthChannelOnlyObserver({
         };
       }
 
-      const assistantSentAt = new Date(now()).toISOString();
+      const assistantSentAt = new Date(deliveredAtMs ?? now()).toISOString();
       records.forEach((record) => {
         ledger.mark(record.idempotencyKey, {
-          status: "delivered",
+          status: deliveryStatus,
           recordedAtMs: Date.parse(assistantSentAt),
         });
-        logObserve(logger, record.event, "delivered");
+        logObserve(logger, record.event, deliveryStatus);
       });
       return {
-        status: "delivered",
+        status: deliveryStatus,
         event: { ...aggregate, assistant_sent_at: assistantSentAt },
       };
     } finally {
@@ -808,6 +859,7 @@ module.exports = {
   safeErrorType,
   safeStartupFailure,
   shortHash,
+  WEIXIN_OUTBOUND_BUBBLE_INTERVAL_MS,
   sortRawMessages,
 };
 

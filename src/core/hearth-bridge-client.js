@@ -1,4 +1,5 @@
 const crypto = require("crypto");
+const { invalidSticker, validateStickerDelivery, readStickerBytes } = require("./hearth-sticker-delivery");
 
 const DEFAULT_TIMEOUT_MS = 10_000;
 const DEFAULT_IMAGE_TIMEOUT_MS = 90_000;
@@ -19,6 +20,7 @@ function createHearthBridgeClient({
   const pseudonymSecret = String(env.HEARTH_BRIDGE_PSEUDONYM_SECRET || "").trim();
   const resolvedTimeoutMs = resolveTimeoutMs(env, timeoutMs);
   const resolvedImageTimeoutMs = resolveImageTimeoutMs(env);
+  const stickerDelivery = env.HEARTH_WEIXIN_STICKER_DELIVERY === "1";
 
   if (!resolvedUrl) {
     throw Object.assign(new Error("Hearth companion URL is not configured"), { code: "config_url_missing" });
@@ -37,6 +39,20 @@ function createHearthBridgeClient({
     url: url.toString(),
     timeoutMs: resolvedTimeoutMs,
     imageTimeoutMs: resolvedImageTimeoutMs,
+    async readSticker(value) {
+      if (!stickerDelivery) throw invalidSticker();
+      const sticker = validateStickerDelivery(value);
+      const imageUrl = new URL(`/internal/channel/stickers/${sticker.id}/image`, url);
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), resolvedTimeoutMs);
+      try {
+        const response = await fetchImpl(imageUrl, {
+          method: "GET", signal: controller.signal, redirect: "error", cache: "no-store",
+          headers: { Authorization: `Bearer ${token}`, "X-Hearth-Sticker-Ticket": sticker.ticket },
+        });
+        return await readStickerBytes(response, sticker);
+      } finally { clearTimeout(timer); }
+    },
     async getRuntimeConfig() {
       const configUrl = new URL(url.toString());
       configUrl.pathname = RUNTIME_CONFIG_PATH;
@@ -74,6 +90,7 @@ function createHearthBridgeClient({
           headers: {
             Authorization: `Bearer ${token}`,
             "Content-Type": "application/json",
+            ...(stickerDelivery ? { "X-Hearth-Sticker-Delivery": "v1" } : {}),
           },
           body: JSON.stringify(envelope),
           signal: controller.signal,
@@ -91,7 +108,7 @@ function createHearthBridgeClient({
         } catch {
           throw Object.assign(new Error("Bridge invalid JSON"), { code: "invalid_json" });
         }
-        return validateBridgeResponse(body);
+        return validateBridgeResponse(body, { allowSticker: stickerDelivery });
       } catch (error) {
         if (error?.name === "AbortError") {
           throw Object.assign(new Error("Bridge timeout"), { code: "timeout" });
@@ -244,7 +261,7 @@ function validateRuntimeConfig(body) {
   };
 }
 
-function validateBridgeResponse(body) {
+function validateBridgeResponse(body, { allowSticker = false } = {}) {
   if (!body || typeof body !== "object" || Array.isArray(body) || body.action !== "send") {
     throw Object.assign(new Error("Bridge response schema invalid"), { code: "invalid_schema" });
   }
@@ -263,7 +280,12 @@ function validateBridgeResponse(body) {
     segments = [];
   }
 
-  if (!segments.length) {
+  let sticker;
+  if (Object.hasOwn(body, "sticker")) {
+    if (!allowSticker) throw invalidSticker();
+    sticker = validateStickerDelivery(body.sticker);
+  }
+  if (!segments.length && !sticker) {
     throw Object.assign(new Error("Bridge empty reply"), { code: "empty_reply" });
   }
 
@@ -272,6 +294,7 @@ function validateBridgeResponse(body) {
     replyText: replyTextRaw || segments.join("\n"),
     segments,
     gatewayProcessedAt: typeof body.gateway_processed_at === "string" ? body.gateway_processed_at : "",
+    ...(sticker ? { sticker } : {}),
   };
 }
 
@@ -283,6 +306,9 @@ function createDryRunDeliverySink() {
   const calls = [];
   return {
     calls,
+    async deliverSticker(sticker) {
+      calls.push({ atMs: Date.now(), stickerId: sticker.id });
+    },
     async deliverSegments(segments) {
       const list = Array.isArray(segments) ? segments.map((value) => String(value || "")) : [];
       calls.push({ atMs: Date.now(), segments: list });
