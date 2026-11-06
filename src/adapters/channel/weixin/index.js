@@ -80,7 +80,13 @@ function createWeixinChannelAdapter(config) {
       );
     return sendChunks.reduce((promise, chunk, index) => promise
       .then(() => {
-        const deliveryChunk = finalizeWeixinDeliveryChunk(chunk) || "Completed.";
+        // Gateway 给出的展示气泡必须原样投递：尤其不能再把末尾“。”削掉，也不能把
+        // ``？`` / ``......`` 这种语气反应泡跟邻居粘回去。旧自动切分仍保留给非桥接调用。
+        const deliveryChunk = (
+          preserveBlock
+            ? trimOuterBlankLines(normalizeLineEndings(chunk))
+            : finalizeWeixinDeliveryChunk(chunk)
+        ) || "Completed.";
         return sendText({
           baseUrl: account.baseUrl,
           token: account.token,
