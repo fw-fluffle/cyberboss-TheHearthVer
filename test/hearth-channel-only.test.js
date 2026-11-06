@@ -7,10 +7,10 @@ const path = require("path");
 const { ChannelIdempotencyStore, MAX_ENTRIES, MAX_ENTRY_AGE_MS } = require("../src/core/channel-idempotency-store");
 const { buildChannelEnvelope, createHearthBridgeClient, pseudonym, validateBridgeResponse } = require("../src/core/hearth-bridge-client");
 const {
-  acquireSingleInstanceLock,
   createHearthChannelOnlyObserver,
   parseObserveConfig,
   resolveEventTime,
+  safeStartupFailure,
   sortRawMessages,
 } = require("../src/app/hearth-channel-only");
 
@@ -63,33 +63,28 @@ test("observe configuration defaults to observe and deny all", () => {
   assert.throws(() => parseObserveConfig({ HEARTH_WEIXIN_MODE: "send" }));
 });
 
-test("single-instance lock rejects a live holder and releases its own lock", () => {
-  const lockPath = path.join(path.dirname(tempPath()), "sidecar.lock");
-  const first = acquireSingleInstanceLock({
-    filePath: lockPath,
-    pid: 101,
-    isProcessAlive: (pid) => pid === 101,
+test("startup failure receipt names the safe stage and maps port ownership", () => {
+  const failure = Object.assign(new Error("PRIVATE_STARTUP_DETAIL"), {
+    code: "EADDRINUSE",
+    hearthStartupStage: "control_plane_bind",
   });
-  assert.throws(() => acquireSingleInstanceLock({
-    filePath: lockPath,
-    pid: 202,
-    isProcessAlive: (pid) => pid === 101,
-  }), /already running/);
-  first.release();
-  assert.equal(fs.existsSync(lockPath), false);
+  const receipt = safeStartupFailure(failure);
+  assert.deepEqual(receipt, {
+    type: "hearth_weixin_observe",
+    status: "fatal",
+    stage: "control_plane_bind",
+    error_type: "Error",
+    error_code: "port_in_use",
+  });
+  assert.equal(JSON.stringify(receipt).includes("PRIVATE_STARTUP_DETAIL"), false);
 });
 
-test("single-instance lock replaces a stale or corrupt lock", () => {
-  const lockPath = path.join(path.dirname(tempPath()), "sidecar.lock");
-  fs.writeFileSync(lockPath, "not-json", "utf8");
-  const lock = acquireSingleInstanceLock({
-    filePath: lockPath,
-    pid: 303,
-    isProcessAlive: () => false,
+test("startup failure receipt rejects arbitrary stage text", () => {
+  const receipt = safeStartupFailure({
+    hearthStartupStage: "PRIVATE_STAGE_TEXT",
   });
-  const stored = JSON.parse(fs.readFileSync(lockPath, "utf8"));
-  assert.equal(stored.pid, 303);
-  lock.release();
+  assert.equal(receipt.stage, "unknown");
+  assert.equal(receipt.error_code, "startup_failed");
 });
 
 test("non-allowlisted messages are denied before normalization", async () => {
@@ -140,6 +135,38 @@ test("bridge envelope is stable, pseudonymous and excludes context token", () =>
   assert.equal(pseudonym("sender", "secret", "wu"), envelope.sender_id); assert.notEqual(pseudonym("other", "secret", "wu"), envelope.sender_id);
 });
 
+test("bridge envelope carries only the narrow image ticket", () => {
+  const envelope = buildChannelEnvelope({
+    account_id: "account",
+    sender_id: "sender",
+    message_id: "image-1",
+    text: "",
+    event_time: 1000,
+    bridge_received_at: new Date(1000).toISOString(),
+    seq: 2,
+    client_id: "c",
+    images: [{
+      media_type: "image/jpeg",
+      data: "c21hbGwtaW1hZ2U=",
+      absolute_path: "D:\\PRIVATE\\fox.jpg",
+      download_url: "https://private.invalid/fox.jpg",
+      aes_key: "PRIVATE_AES_KEY",
+    }],
+    attachments: [{ raw_weixin_payload: "PRIVATE_RAW_PAYLOAD" }],
+  }, "secret");
+
+  assert.deepEqual(envelope.images, [{
+    media_type: "image/jpeg",
+    data: "c21hbGwtaW1hZ2U=",
+  }]);
+  const serialized = JSON.stringify(envelope);
+  assert.ok(!serialized.includes("PRIVATE"));
+  assert.ok(!serialized.includes("absolute_path"));
+  assert.ok(!serialized.includes("download_url"));
+  assert.ok(!serialized.includes("aes_key"));
+  assert.ok(!serialized.includes("attachments"));
+});
+
 test("bridge delivers validated segments once and persists delivered", async () => {
   const adapter = createAdapter(); const ledgerPath = tempPath(); let requests = 0;
   const observer = createHearthChannelOnlyObserver({ adapter, config: { stateDir: path.dirname(ledgerPath) }, env: { HEARTH_WEIXIN_MODE: "bridge", HEARTH_WEIXIN_ALLOWED_USER_IDS: "allowed-user" }, logger: createLogger(), idempotencyStore: new ChannelIdempotencyStore({ filePath: ledgerPath }), bridgeClient: { async request() { requests += 1; return { segments: ["one", "two"] }; } } });
@@ -148,6 +175,140 @@ test("bridge delivers validated segments once and persists delivered", async () 
   assert.equal((await observer.processRawMessage(message(), { accountId: "account-1" })).status, "duplicate"); assert.equal(requests, 1);
   const restart = createHearthChannelOnlyObserver({ adapter: createAdapter(), config: { stateDir: path.dirname(ledgerPath) }, env: { HEARTH_WEIXIN_MODE: "bridge", HEARTH_WEIXIN_ALLOWED_USER_IDS: "allowed-user" }, logger: createLogger(), idempotencyStore: new ChannelIdempotencyStore({ filePath: ledgerPath }), bridgeClient: { async request() { throw new Error("should not call"); } } });
   assert.equal((await restart.processRawMessage(message(), { accountId: "account-1" })).status, "duplicate");
+});
+
+test("bridge aggregates consecutive user bubbles into one queued logical turn", async () => {
+  const adapter = createAdapter();
+  const captured = [];
+  const observer = createHearthChannelOnlyObserver({
+    adapter,
+    config: { stateDir: path.dirname(tempPath()) },
+    env: {
+      HEARTH_WEIXIN_MODE: "bridge",
+      HEARTH_WEIXIN_ALLOWED_USER_IDS: "allowed-user",
+    },
+    logger: createLogger(),
+    bridgeClient: {
+      async getRuntimeConfig() {
+        return { inboundBufferSeconds: 6, bubbleMode: "natural" };
+      },
+      async request(event) {
+        captured.push(event);
+        return { segments: ["？", "你在说啥啊"] };
+      },
+    },
+  });
+
+  const first = await observer.processRawMessage(message({
+    message_id: "bubble-1",
+    client_id: "bubble-client-1",
+    seq: 1,
+    create_time_ms: 1000,
+    text: "哥哥",
+  }), { accountId: "account-1" });
+  const second = await observer.processRawMessage(message({
+    message_id: "bubble-2",
+    client_id: "bubble-client-2",
+    seq: 2,
+    create_time_ms: 1200,
+    text: "。",
+  }), { accountId: "account-1" });
+
+  assert.equal(first.status, "buffered");
+  assert.equal(second.status, "buffered");
+  assert.equal(captured.length, 0);
+  await observer.flushPendingTurns();
+  assert.equal(captured.length, 1);
+  assert.equal(captured[0].text, "哥哥\n。");
+  assert.equal(captured[0].bubble_count, 2);
+  assert.deepEqual(captured[0].bubble_texts, ["哥哥", "。"]);
+  assert.deepEqual(captured[0].bubble_message_ids, ["bubble-1", "bubble-2"]);
+  assert.match(captured[0].logical_turn_id, /^wturn_[0-9a-f]{24}$/);
+  assert.deepEqual(adapter.calls.textPayloads.map((item) => item.text), ["？", "你在说啥啊"]);
+  assert.ok(adapter.calls.textPayloads.every((item) => item.preserveBlock === true));
+});
+
+test("image-only bridge prepares the picture before asking Hearth", async () => {
+  const adapter = createAdapter();
+  let capturedEvent = null;
+  let prepareCalls = 0;
+  const observer = createHearthChannelOnlyObserver({
+    adapter,
+    config: { stateDir: path.dirname(tempPath()), weixinCdnBaseUrl: "https://cdn.invalid" },
+    env: { HEARTH_WEIXIN_MODE: "bridge", HEARTH_WEIXIN_ALLOWED_USER_IDS: "allowed-user" },
+    logger: createLogger(),
+    prepareImages: async ({ attachments }) => {
+      prepareCalls += 1;
+      assert.equal(attachments.length, 1);
+      return {
+        images: [{ media_type: "image/png", data: "c21hbGwtaW1hZ2U=" }],
+        failures: [],
+      };
+    },
+    bridgeClient: {
+      async request(event) {
+        capturedEvent = event;
+        return { segments: ["哥哥看见啦"] };
+      },
+    },
+  });
+
+  const result = await observer.processRawMessage(message({
+    message_id: "image-only-success",
+    text: "",
+    attachments: [{
+      kind: "image",
+      mediaRef: { downloadUrl: "PRIVATE_URL", aesKey: "PRIVATE_AES_KEY" },
+    }],
+  }), { accountId: "account-1" });
+
+  assert.equal(result.status, "delivered");
+  assert.equal(prepareCalls, 1);
+  assert.equal(capturedEvent.text, "");
+  assert.deepEqual(capturedEvent.images, [{
+    media_type: "image/png",
+    data: "c21hbGwtaW1hZ2U=",
+  }]);
+  assert.equal(adapter.calls.textPayloads.at(-1).text, "哥哥看见啦");
+  assert.ok(!JSON.stringify(capturedEvent).includes("PRIVATE"));
+});
+
+test("image intake failure warns once, never calls Hearth, and deduplicates", async () => {
+  const adapter = createAdapter();
+  const ledgerPath = tempPath();
+  let requests = 0;
+  const observer = createHearthChannelOnlyObserver({
+    adapter,
+    config: { stateDir: path.dirname(ledgerPath) },
+    env: { HEARTH_WEIXIN_MODE: "bridge", HEARTH_WEIXIN_ALLOWED_USER_IDS: "allowed-user" },
+    logger: createLogger(),
+    idempotencyStore: new ChannelIdempotencyStore({ filePath: ledgerPath }),
+    prepareImages: async () => ({
+      images: [],
+      failures: [{ reason: "attachment_intake_failed" }],
+    }),
+    bridgeClient: {
+      async request() {
+        requests += 1;
+        return { segments: ["不该出现"] };
+      },
+    },
+  });
+  const imageMessage = message({
+    message_id: "image-intake-failure",
+    text: "",
+    attachments: [{ kind: "image" }],
+  });
+
+  const first = await observer.processRawMessage(imageMessage, { accountId: "account-1" });
+  const duplicate = await observer.processRawMessage(imageMessage, { accountId: "account-1" });
+
+  assert.equal(first.status, "attachment_failed");
+  assert.equal(duplicate.status, "duplicate");
+  assert.equal(requests, 0);
+  assert.equal(adapter.calls.sendTyping, 0);
+  assert.equal(adapter.calls.sendText, 1);
+  assert.match(adapter.calls.textPayloads[0].text, /图片.*重发/);
 });
 
 test("bridge validation and failures never deliver partial invalid responses", async () => {

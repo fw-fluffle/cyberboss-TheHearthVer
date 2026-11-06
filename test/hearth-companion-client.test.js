@@ -14,7 +14,9 @@ const {
   normalizeCompanionUrl,
   pseudonym,
   resolveCompanionUrl,
+  resolveImageTimeoutMs,
   validateBridgeResponse,
+  validateRuntimeConfig,
 } = require("../src/core/hearth-bridge-client");
 const { createHearthChannelOnlyObserver } = require("../src/app/hearth-channel-only");
 
@@ -167,6 +169,43 @@ test("envelope mapping is pseudonymous and excludes context_token and raw payloa
   assert.ok(!serialized.includes("sender-raw"));
   assert.ok(!serialized.includes("\"cid\""));
   assert.ok(!serialized.includes("raw_weixin"));
+});
+
+test("runtime config accepts only the bounded chat presentation ticket", () => {
+  assert.deepEqual(
+    validateRuntimeConfig({ inbound_buffer_seconds: 6, bubble_mode: "natural" }),
+    { inboundBufferSeconds: 6, bubbleMode: "natural" },
+  );
+  assert.throws(() => validateRuntimeConfig({ inbound_buffer_seconds: 16, bubble_mode: "natural" }));
+  assert.throws(() => validateRuntimeConfig({ inbound_buffer_seconds: 6, bubble_mode: "wild" }));
+});
+
+test("image envelope strips transport secrets and image timeout is independent", () => {
+  const event = {
+    account_id: "account-raw",
+    sender_id: "sender-raw",
+    message_id: "image-envelope",
+    text: "",
+    event_time: 1_720_000_000_000,
+    bridge_received_at: "2026-07-12T21:30:01+08:00",
+    seq: 9,
+    client_id: "cid",
+    images: [{
+      media_type: "image/webp",
+      data: "c21hbGwtaW1hZ2U=",
+      absolutePath: "/private/fox.webp",
+      rawPayload: "PRIVATE_RAW_PAYLOAD",
+    }],
+  };
+  const envelope = buildChannelEnvelope(event, "secret");
+  assert.deepEqual(envelope.images, [{
+    media_type: "image/webp",
+    data: "c21hbGwtaW1hZ2U=",
+  }]);
+  assert.ok(!JSON.stringify(envelope).includes("PRIVATE"));
+  assert.ok(!JSON.stringify(envelope).includes("absolutePath"));
+  assert.equal(resolveImageTimeoutMs({ HEARTH_IMAGE_REQUEST_TIMEOUT_MS: "4321" }), 4321);
+  assert.equal(resolveImageTimeoutMs({ HEARTH_IMAGE_REQUEST_TIMEOUT_MS: "0" }), 90_000);
 });
 
 test("envelope raw_metadata.client_id is HMAC-pseudonymized under Gateway length cap", () => {
@@ -339,6 +378,33 @@ test("real client times out and rejects invalid JSON/contracts", async () => {
     () => timeoutClient.request({
       account_id: "a", sender_id: "s", message_id: "m", text: "t",
       event_time: 1, bridge_received_at: new Date(1).toISOString(), seq: 1, client_id: "c",
+    }),
+    (error) => error.code === "timeout",
+  );
+
+  // 图片轮单独使用更长（这里故意调短）的窗口，不会把普通文字的 250ms 配置偷偷改掉。
+  const imageTimeoutClient = createHearthBridgeClient({
+    env: bridgeEnv({
+      HEARTH_REQUEST_TIMEOUT_MS: "250",
+      HEARTH_IMAGE_REQUEST_TIMEOUT_MS: "20",
+    }),
+    fetchImpl: async (_url, init) => new Promise((_resolve, reject) => {
+      init.signal.addEventListener("abort", () => reject(Object.assign(new Error("aborted"), { name: "AbortError" })));
+    }),
+  });
+  assert.equal(imageTimeoutClient.timeoutMs, 250);
+  assert.equal(imageTimeoutClient.imageTimeoutMs, 20);
+  await assert.rejects(
+    () => imageTimeoutClient.request({
+      account_id: "a",
+      sender_id: "s",
+      message_id: "image-timeout",
+      text: "",
+      images: [{ media_type: "image/jpeg", data: "c21hbGwtaW1hZ2U=" }],
+      event_time: 1,
+      bridge_received_at: new Date(1).toISOString(),
+      seq: 1,
+      client_id: "c",
     }),
     (error) => error.code === "timeout",
   );
